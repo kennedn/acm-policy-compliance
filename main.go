@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/discovery"
 	memory "k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
@@ -85,17 +87,28 @@ func main() {
 		log.Fatalf("extract templates: %v", err)
 	}
 
-	var out []map[string]interface{}
+	var (
+		out []map[string]interface{}
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+	)
 	for _, cluster := range clusters {
 		for _, tmpl := range templates {
-			info, err := fetchResource(ctx, dyn, mapper, cluster, tmpl)
-			if err != nil {
-				log.Printf("warn: %v", err)
-				continue
-			}
-			out = append(out, info)
+			wg.Add(1)
+			go func(cluster string, tmpl template) {
+				defer wg.Done()
+				info, err := fetchResource(ctx, dyn, mapper, cluster, tmpl)
+				if err != nil {
+					log.Printf("warn: %v", err)
+					return
+				}
+				mu.Lock()
+				out = append(out, info)
+				mu.Unlock()
+			}(cluster, tmpl)
 		}
 	}
+	wg.Wait()
 
 	data, err := yaml.Marshal(out)
 	if err != nil {
@@ -208,21 +221,21 @@ func fetchResource(ctx context.Context, dyn dynamic.Interface, mapper meta.RESTM
 
 	// Wait for result to appear
 	var result map[string]interface{}
-	for i := 0; i < 30; i++ {
+	err = wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
 		current, err := dyn.Resource(mcvGVR).Namespace(cluster).Get(ctx, uid, metav1.GetOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("get managedclusterview: %w", err)
+			return false, fmt.Errorf("get managedclusterview: %w", err)
 		}
 		if status, ok := current.Object["status"].(map[string]interface{}); ok {
 			if res, ok := status["result"].(map[string]interface{}); ok {
 				result = res
-				break
+				return true, nil
 			}
 		}
-		time.Sleep(1 * time.Second)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("timed out waiting for managedclusterview result")
+		return false, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("wait for managedclusterview result: %w", err)
 	}
 	obj := &unstructured.Unstructured{Object: result}
 	return extractInfo(obj), nil
